@@ -101,6 +101,80 @@ proxy server一共提供两种gRPC服务,一种是ProxyService,代理上游客�
 
 ### BackendManager
 
+<font color=red>BackendManager是proxy server管理与proxy agent的gRPC连接的组件</font>
+
+Proxy server与proxy agent的gRPC连接被封装成一个backend结构体,它实现了Backend接口.
+
+```go
+type Backend interface {
+	Send(p *client.Packet) error
+	Context() context.Context
+}
+
+type backend struct {
+	// TODO: this is a multi-writer single-reader pattern, it's tricky to
+	// write it using channel. Let's worry about performance later.
+	mu   sync.Mutex // mu protects conn
+	conn agent.AgentService_ConnectServer
+}
+```
+
+可以看到,里面有一个AgentService服务Connect方法的流引用.<font color=red>所以可以把Backend当成一个proxy server和proxy agent的gRPC连接.</font>
+
+BackendManager的功能为: 根据proxy策略选择一个Backend,存储所有的Backend,检查Backend是否准备就绪.
+
+![image-20211119164415731](https://tva1.sinaimg.cn/large/008i3skNly1gwkjxpfxhvj30wl0grjtc.jpg)
+
+根据不同的代理策略,一共有三种BackendManager实现,分别以不同的方式管理着Backend.
+
+首先三种代理策略分别为:
+
+- default: 这种策略下proxy server会随机选择一个健康的backend建立隧道(这个建立隧道是proxy agent到后端服务的TCP连接,而不是proxy server和proxy agent的gRPC连接, 这个gRPC连接是通过proxy agent反向建立的)
+- destHost: 这种策略下,proxy server会选择一个主机名与request.Host相同的backend
+- defaultRoute: 这种策略下,只会将流量转发到已通过agent identifier显式表明它们为默认路由提供服务的代理.
+
+可以看到,不同的manager的唯一区别就是Backend方法的实现,即如何选择backend.而存储Backend的`BackendStroage`实现方式只有一种.
+
+#### DefaultBackendStorage
+
+```go
+// DefaultBackendStorage is the default backend storage.
+type DefaultBackendStorage struct {
+	mu sync.RWMutex //protects the following
+	// A map between agentID and its grpc connections.
+	// For a given agent, ProxyServer prefers backends[agentID][0] to send
+	// traffic, because backends[agentID][1:] are more likely to be closed
+	// by the agent to deduplicate connections to the same server.
+	backends map[string][]*backend
+	// agentID is tracked in this slice to enable randomly picking an
+	// agentID in the Backend() method. There is no reliable way to
+	// randomly pick a key from a map (in this case, the backends) in
+	// Golang.
+	agentIDs []string
+	// defaultRouteAgentIDs tracks the agents that have claimed the default route.
+	defaultRouteAgentIDs []string
+	random               *rand.Rand
+	// idTypes contains the valid identifier types for this
+	// DefaultBackendStorage. The DefaultBackendStorage may only tolerate certain
+	// types of identifiers when associating to a specific BackendManager,
+	// e.g., when associating to the DestHostBackendManager, it can only use the
+	// identifiers of types, IPv4, IPv6 and Host.
+	idTypes []pkgagent.IdentifierType
+}
+```
+
+- backends: 存储着agentID到与它的gRPC连接的映射.可能觉得proxy agent可以拥有相同的agentID,所以这里backend为slice.<font color=red>但相同agentID的backend,proxy server只选择第一个去使用.</font>
+- agentIDs: 存储着已经建立连接的agentID
+- defaultRouteAgentIDs: 存储着身份标识为defaultRoute的agentID.
+- random: 随机数生成器.用来随机返回某个agentID下的backend供proxy server使用
+- idTypes: 存储着该manager所能接受的合法的agent身份标识.比如DestHostBackendManager只能存储IPv4、IPv6、Host类型的agent.所以当创建DefaultBackendStorage的时候,只需要传入所能接受的idTypes集合就行了.
+
+AddBackend、RemoveBackend和NumBackend方法的逻辑也很简单.
+
+除了实现了BackendStorage接口中的三个方法外,DefaultBackendStorage还实现了一个GetRandomBackend()方法,用来随机返回某一个agentID下的backend.
+
+![image-20211119180548140](https://tva1.sinaimg.cn/large/008i3skNly1gwkmak2x16j30pt09iq42.jpg)
+
 
 
 ## Proxy Agent
@@ -292,6 +366,21 @@ type ClientSet struct {
 - probeInterval: 定期检查与所有server实例连接是否就绪的间隔
 - syncIntervalCap: 当无法连接到server时，syncInterval 回退的最大间隔
 
+其他字段:
+
+- agentIdentifiers: 是proxy agent的身份标识, 被proxy server用来选择proxy agent.一共有6种身份标识
+
+  ```go
+  const (
+  	IPv4         IdentifierType = "ipv4"
+  	IPv6         IdentifierType = "ipv6"
+  	Host         IdentifierType = "host"
+  	CIDR         IdentifierType = "cidr"
+  	UID          IdentifierType = "uid"
+  	DefaultRoute IdentifierType = "default-route"
+  )
+  ```
+
 我们使用proxy agent功能实际上就是建立一个ClientSet实例,然后调用它的Serve()方法就可以了.Serve方法会开启一个协程,开始进行连接建立的同步过程.
 
 ```go
@@ -300,7 +389,7 @@ func (cs *ClientSet) Serve() {
 }
 ```
 
-![image-20211119112635677](https://tva1.sinaimg.cn/large/008i3skNly1gwkar2txyij30ku0fljsa.jpg)
+![image-20211119112635677](https://tva1.sinaimg.cn/large/008i3skNly1gwki0eudjvj30ku0flmy2.jpg)
 
 这个函数不断的调用syncOnce()函数,并监听退出信号.如果收到退出信号会调用shutdown方法,该方法会清除所有存储的Client实例.
 
@@ -308,7 +397,7 @@ func (cs *ClientSet) Serve() {
 
 所以这个方法的核心功能就是syncOnce()函数的功能.
 
-![image-20211119135425008](https://tva1.sinaimg.cn/large/008i3skNly1gwkf0yfbmaj30wp0go0uc.jpg)
+![image-20211119135425008](https://tva1.sinaimg.cn/large/008i3skNly1gwki0jcvy0j30wp0go404.jpg)
 
 一次同步过程所做的工作如下:
 
