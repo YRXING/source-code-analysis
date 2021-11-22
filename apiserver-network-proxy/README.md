@@ -229,17 +229,21 @@ type ProxyClientConnection struct {
 }
 ```
 
-该结构体只有一个send()方法,用来返回给客户端数据.
-
 Mode: 客户端连接proxy server的方式, 支持两种: grpc和http-connect.
 
 Grpc: 客户端以gRPC方式连接到proxy server时的流引用.
 
-HTTP: 如果Mode为http-connect, proxy server返回给客户端的数据通过此方法返回.
+HTTP: 如果Mode为http-connect, proxy server返回给客户端的数据通过此方法返回.本质就是就是一个TCP连接
 
 CloseHTTP: 当proxy agent返回给proxy server一个CloseResponse时候,如果proxy server时http-connect的方式,将会调用此方法关闭http连接
 
+connected: 用来通知隧道是否已经打通, 一般收到DialResponse时候会把该通道关闭,用来通知别人隧道已经打通.
+
 backend: 前端连接对应的后端连接,客户端发送给proxy server的数据, proxy server要找到对应的后端连接才能把数据发送到正确的proxy agent.
+
+该结构体只有一个send()方法,用来返回给客户端数据.
+
+![image-20211122180523048](https://tva1.sinaimg.cn/large/008i3skNly1gwo351tfx0j30td0hlq4s.jpg)
 
 ### 结构定义
 
@@ -452,15 +456,45 @@ type Tunnel struct {
 
 它实现了ServeHTTP方法,即Tunnel本质就是一个http server handler.
 
+<font color=red>它主要实现的逻辑就是从客户端读取数据,封装成gRPC服务器所能识别的数据包后,调用backend发送给proxy agent,数据包返回给客户端的写回操作则在Connect服务中处理来自proxy agent数据包的逻辑中实现.</font>
 
+1. 首先客户端发起的http请求,method必须为connect.
 
+   `The HTTP CONNECT method is used to create an HTTP tunnel through a proxy server. By sending an HTTP CONNECT request, the client asks the proxy server to forward the TCP connection to the desired destination.`
 
+   connect的作用就是将服务器作为代理,让服务器代替用户取访问其他网页,之后将数据返回给用户.因为是http协议的一部分,所以connect报文也是通过TCP连接发送给代理服务器的,如果代理服务器响应200 Cnnection Established表示连接建立成功,之后就可以发送正常的http请求给代理服务器了.
 
+   ![image-20211122174701581](https://tva1.sinaimg.cn/large/008i3skNly1gwo2lwgfi4j30sr032t8t.jpg)
 
+2. 然后通过http请求头部host信息找到对应backend,发送DialRequset数据包
 
+   ![image-20211122180930427](https://tva1.sinaimg.cn/large/008i3skNly1gwo39at0jwj30x90d50tu.jpg)
 
+   当然在发送数据包之前,也要像Proxy服务那样在PendingDial中添加ProxyClientConnection,以供数据返回使用.
 
-## Proxy Agent
+   ![image-20211122181129865](https://tva1.sinaimg.cn/large/008i3skNly1gwo3bdlvb0j30xb0e13zs.jpg)
+
+   HTTP中的conn是劫持客户端到proxy server的tcp连接.该功能只支持HTTP/1.x版本.
+
+   ![image-20211122181319084](https://tva1.sinaimg.cn/large/008i3skNly1gwo3d9em4gj30xa08x3z6.jpg)
+
+   这样http连接的管理将由handler,即Tunnel纳管.因此需要在适当时候主动关闭连接.
+
+3. 接下来开始处理数据
+
+   当隧道已经打通后,即收到监听到connected通道被关闭的信号后,开始读取客户端请求,封装成Data数据包,调用相应backend发送数据.
+
+   ![image-20211122192842988](https://tva1.sinaimg.cn/large/008i3skNly1gwo5jpyl4mj31100os40o.jpg)
+
+4. 关闭连接
+
+   当客户端数据发送完毕后,在给proxy agent发送一个CloseRequest数据包,表示关闭相应连接.
+
+   ![image-20211122193042385](https://tva1.sinaimg.cn/large/008i3skNly1gwo5ls93jhj31280bgt9k.jpg)
+
+<font color=red>整个流程和Proxy服务类似,只不过gRPC客户端的连接请求需要自己发送,而HTTP客户端需要发送http connect请求,代理服务器通过http头部信息发送连接请求,而且收到的客户端数据也需要代理服务器封装成相应数据包才能通过gRPC连接发送给proxy agent.</font>
+
+## Proy Agent
 
 A gRPC proxy agent, connects to the proxy and then allows traffic to be forwarded to it.
 
@@ -680,7 +714,7 @@ func (cs *ClientSet) Serve() {
 
 所以这个方法的核心功能就是syncOnce()函数的功能.
 
-![image-20211122143356956](https://tva1.sinaimg.cn/large/008i3skNgy1gwnx12ecy6j30wp0go404.jpg)
+![image-20211122193914666](https://tva1.sinaimg.cn/large/008i3skNly1gwo5uo4i18j30xj0gvdhp.jpg)
 
 一次同步过程所做的工作如下:
 
