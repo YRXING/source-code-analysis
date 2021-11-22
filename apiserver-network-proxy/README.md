@@ -75,7 +75,7 @@ PacketType一共有6种类型.
 
 ![image-20211118210441139](https://tva1.sinaimg.cn/large/008i3skNly1gwjluakchmj30lj060jrg.jpg)
 
-- DialRequest: 发起对后端服务的访问请求(这个后端服务就是agent要代理的服务),该数据包字段有protocol、后端服务的地址address、一个连接标识random.
+- DialRequest: 发起对后端服务的访问请求(这个后端服务就是agent要代理的服务),该数据包字段有protocol、后端服务的地址address、一个客户端连接标识random.
 
   ![image-20211118211316777](https://tva1.sinaimg.cn/large/008i3skNly1gwjm38tx0mj30fz076wel.jpg)
 
@@ -287,7 +287,7 @@ Readiness: 检查proxy server是否就绪,即是否和proxy agent有连接,而�
 
 frontends: 存储着proxy server到真正客户端的连接.通过frontends\[agentID][connID]来唯一确定一个真正客户端到proxy server的连接.connID是proxy agent与真正后端服务建立的tcp连接.
 
-PendingDial: 
+PendingDial: 已经发送DialRequest并等待响应的客户端连接,隧道成功建立后客户端连接将由frontends纳管.
 
 AgentAuthenticationOptions: 用来进行身份验证的
 
@@ -330,6 +330,133 @@ proxy server和proxy agent之间的gRPC连接通过BackendManager管理着,proxy
 proxy server一共提供两种gRPC方法: 一个用于proxy agent的Connect方法,一个用于代理客户端的Proxy方法.
 
 #### Connect
+
+当proxy agent实例启动的时候,一开始就会建立与Proxy server的反向连接, 然后调用proxy server的connect服务.
+
+1. 该服务首先从gRPC流中拿到agentID
+
+2. 如果proxy server启动了认证agent的选项, 则会从gRPC流中拿到stream的context信息去进行认证.
+
+3. 然后把自己的serverID和serverCount信息通过stream发送给proxy agent,再把该gRPC流存储到BackendManager中
+
+   ```go
+   	h := metadata.Pairs(header.ServerID, s.serverID, header.ServerCount, strconv.Itoa(s.serverCount))
+   	if err := stream.SendHeader(h); err != nil {
+   		klog.ErrorS(err, "Failed to send server count back to agent", "agentID", agentID)
+   		return err
+   	}
+   
+   	backend := s.addBackend(agentID, stream)
+   	defer s.removeBackend(agentID, stream)
+   ```
+
+4. 此时gRPC连接已经准备就绪,开始异步处理来自proxy agent的数据.一个协程专门用来接受来自proxy agent的数据,一个协程专门来处理数据.<font color=red>因此每一个proxy agent连接到proxy server后,proxy server都会开启两个协程为其服务.</font>
+
+   ![image-20211122144531532](https://tva1.sinaimg.cn/large/008i3skNly1gwnxd2f2l0j312k0ocacf.jpg)
+
+可以看到只要proxy agent与proxy server之间的gRPC连接建立, 它的关闭不由proxy server控制,而是由proxy agent决定,当proxy agent关闭数据流时候, 即`err == io.EOF`,这两个协程才会退出.
+
+下面来看一下proxy server是怎么处理来自proxy agent的数据包的:
+
+来自proxy agent的数据包一共有三种类型: DialResponse、Data、CloseResponse.
+
+- DialResponse数据包
+
+  ![image-20211122151355105](https://tva1.sinaimg.cn/large/008i3skNly1gwny6oprwrj30ze0mhn05.jpg)
+
+  首先从PendingDial中拿到等待连接响应的前端连接frontend
+
+  然后把数据包返回给客户端,并从PendingDial中移除该客户端连接,表示隧道已经打通
+
+  最后把前端连接由fronteds纳管,由agentID和ConnectID唯一标识.
+
+- Data数据包
+
+  ![image-20211122152022073](https://tva1.sinaimg.cn/large/008i3skNly1gwnydbkc9xj30zk09kta0.jpg)
+
+  该数据包就是普通的数据包,通过frontend返回给客户端即可.
+
+- CloseResponse数据包
+
+  如果是关闭连接的响应数据包,proxy server会返回给客户端响应并移除前端连接,注意此时只是移除了前端连接,proxy server和proxy agent的gRPC连接没有移除.为了后面的连接复用.而proxy agent收到关闭请求数据包后也只是移除与后端服务的tcp连接.
+
+<font color=red>当proxy agent关闭数据流后,proxy server会把所有建立在此gRPC连接之上的前端连接都清除掉.</font>
+
+![image-20211122161249165](https://tva1.sinaimg.cn/large/008i3skNly1gwnzvwgug1j313k0hn41b.jpg)
+
+
+
+#### Proxy
+
+proxy服务提供给gRPC客户端使用,用来代理来自客户端的连接.连接准备过程和Connect服务很类似,只不过一个处理proxy agent的连接,一个是处理客户端的连接.
+
+1. 首先从数据流stream中读取context中的user-agent信息
+
+   ![image-20211122163011216](https://tva1.sinaimg.cn/large/008i3skNly1gwo0dycwakj30r6055weu.jpg)
+
+2. 然后开启两个协程,一个读取来自客户端的数据,一个处理数据,和Connect服务的逻辑一样
+
+   ![image-20211122163206307](https://tva1.sinaimg.cn/large/008i3skNly1gwo0fy6249j312v0p540x.jpg)
+
+
+
+下面是如何proxy server如何处理来自客户端的数据的:
+
+来自客户端的数据有四种: DialRequest、Data、CloseRequest、DialClose
+
+- DialRequest数据包
+
+  来自客户端的第一个数据包应该是DialRequest,因为需要首先建立到真正后端服务的连接,打通隧道,才可以进行数据的传输.
+
+  ![image-20211122164642609](https://tva1.sinaimg.cn/large/008i3skNly1gwo0v5sbwdj30zs0o977f.jpg)
+
+  首先是根据Address获取到与proxy agent的连接backend
+
+  然后封装ProxyCLientConnection,并存储到PendingDial中,这里面存放都都是等待连接响应的前端连接.
+
+  最后把连接请求通过backend发送到特定的proxy agent取打通隧道.
+
+- Data数据包
+
+  这个数据包处理很简单,就是通过backend.Send()把数据包发送给proxy agent.(backend和connID会存放在局部变量中,再次使用backend时候不用每次从BackendManager中去get)
+
+- CloseRequest数据包
+
+  依旧是调用backend.Send()把数据包发送给proxy agent.
+
+- DialClose数据包
+
+  从PendingDial中移除给定的前端连接
+
+  ![image-20211122170327183](https://tva1.sinaimg.cn/large/008i3skNly1gwo1ckmzg1j30x6053aaq.jpg)
+
+当客户端关闭数据流后,Proxy服务到此结束,两个协程也关闭.
+
+![image-20211122171005339](https://tva1.sinaimg.cn/large/008i3skNly1gwo1jhrh0bj311k0lxjtn.jpg)
+
+<font color=red>从代码可以看到,该服务没有像Connect服务一样结束后,清除相应的连接.这是因为该服务是双向gRPC流模式,客户端关闭连接后可能还有数据发送过来,所以没有相应的清除规则, 把清除动作交给了proxy agent.</font>
+
+
+
+### HTTP代理
+
+前面讲的两个服务都是gRPC服务,也就是说proxy server只能代理gRPC客户端,而Tunnel就是为了支持HTTP客户端而设计的
+
+```go
+// Tunnel implements Proxy based on HTTP Connect, which tunnels the traffic to
+// the agent registered in ProxyServer.
+type Tunnel struct {
+	Server *ProxyServer
+}
+```
+
+它实现了ServeHTTP方法,即Tunnel本质就是一个http server handler.
+
+
+
+
+
+
 
 
 
@@ -553,7 +680,7 @@ func (cs *ClientSet) Serve() {
 
 所以这个方法的核心功能就是syncOnce()函数的功能.
 
-![image-20211119135425008](https://tva1.sinaimg.cn/large/008i3skNly1gwkmesm15wj30wp0go404.jpg)
+![image-20211122143356956](https://tva1.sinaimg.cn/large/008i3skNgy1gwnx12ecy6j30wp0go404.jpg)
 
 一次同步过程所做的工作如下:
 
