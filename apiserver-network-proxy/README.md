@@ -99,6 +99,8 @@ A gRPC proxy server, receives requests from the API server and forwards to the a
 
 proxy server一共提供两种gRPC服务,一种是ProxyService,代理上游客户端连接,一种是AgentService,供下游proxy agent反向连接使用.
 
+
+
 ### BackendManager
 
 <font color=red>BackendManager是proxy server管理与proxy agent的gRPC连接的组件</font>
@@ -171,9 +173,163 @@ type DefaultBackendStorage struct {
 
 AddBackend、RemoveBackend和NumBackend方法的逻辑也很简单.
 
-除了实现了BackendStorage接口中的三个方法外,DefaultBackendStorage还实现了一个GetRandomBackend()方法,用来随机返回某一个agentID下的backend.
+除了实现了BackendStorage接口中的三个方法外,DefaultBackendStorage还实现了一个GetRandomBackend()方法,用来随机返回已经存储的某一个agentID下的backend.
 
 ![image-20211119180548140](https://tva1.sinaimg.cn/large/008i3skNly1gwkmak2x16j30pt09iq42.jpg)
+
+还有一个RedinessManager下的Ready()方法, 该方法就判断backend数量是否为0.
+
+![image-20211122095909996](https://tva1.sinaimg.cn/large/008i3skNly1gwnp34mk3pj30m60axwf9.jpg)
+
+#### DefaultBackendManager
+
+由前面得知,不同的BackendManager只是Backend()方法的实现逻辑不一样,即从Storage中获取Backend的方式不同.而他们后端的存储统一使用DefaultBackendManager.所以他们有统一的结构体定义,即: 内嵌一个DefaultBackendStorage结构体.
+
+```go
+type XXXBackendManager struct {
+  *DefaultBackendStorae
+}
+```
+
+DefaultBackendManager是从DefaultBackendManager中随机获取一个backend.即:<font color=red>随机获取一个gRPC连接传递信息.它支持的IdentifierType只有UID类型.</font>
+
+![image-20211122101533158](https://tva1.sinaimg.cn/large/008i3skNly1gwnpk4djjzj30ow06n3z3.jpg)
+
+#### DestHostBackendManager
+
+<font color=red>他所支持的IdentifierType有IPv4、IPv6、Host.</font>
+
+![image-20211122102207949](https://tva1.sinaimg.cn/large/008i3skNly1gwnpqzhngtj30zl0c875o.jpg)
+
+DestHostBackendManager就是从context中获取k-v信息,然后去backends里面找.
+
+#### DefaultRouteBackendManager
+
+<font color=red>他所支持的IdentifierType只有default-route.</font>
+
+![image-20211122102632653](https://tva1.sinaimg.cn/large/008i3skNly1gwnpvke3clj30px0a4dh6.jpg)
+
+而他获取backend的方式就是随机从defaultRouteAgentID里面获取一个agentID,返回该连接.以DefaultRoute方式代理的agentID单独存放在一个数组里.
+
+### ProxyClientConnection
+
+ProxyClientConnection代表了逻辑上的一个客户端代理连接,即:真正客户端到proxy server之间的连接.后端服务的所有数据都要通过proxy server返回给客户端.
+
+```go
+type ProxyClientConnection struct {
+	Mode      string
+	Grpc      client.ProxyService_ProxyServer
+	HTTP      io.ReadWriter
+	CloseHTTP func() error
+	connected chan struct{}
+	connectID int64
+	agentID   string
+	start     time.Time
+	backend   Backend
+}
+```
+
+该结构体只有一个send()方法,用来返回给客户端数据.
+
+Mode: 客户端连接proxy server的方式, 支持两种: grpc和http-connect.
+
+Grpc: 客户端以gRPC方式连接到proxy server时的流引用.
+
+HTTP: 如果Mode为http-connect, proxy server返回给客户端的数据通过此方法返回.
+
+CloseHTTP: 当proxy agent返回给proxy server一个CloseResponse时候,如果proxy server时http-connect的方式,将会调用此方法关闭http连接
+
+backend: 前端连接对应的后端连接,客户端发送给proxy server的数据, proxy server要找到对应的后端连接才能把数据发送到正确的proxy agent.
+
+### 结构定义
+
+```go
+type PendingDialManager struct {
+	mu          sync.RWMutex
+	pendingDial map[int64]*ProxyClientConnection
+}
+
+// ProxyServer
+type ProxyServer struct {
+	// BackendManagers contains a list of BackendManagers
+	BackendManagers []BackendManager
+
+	// Readiness reports if the proxy server is ready, i.e., if the proxy
+	// server has connections to proxy agents (backends). Note that the
+	// proxy server does not check the healthiness of the connections,
+	// though the proxy agents do, so this readiness check might report
+	// ready but there is no healthy connection.
+	Readiness ReadinessManager
+
+	// fmu protects frontends.
+	fmu sync.RWMutex
+	// conn = Frontend[agentID][connID]
+	frontends map[string]map[int64]*ProxyClientConnection
+
+	PendingDial *PendingDialManager
+
+	serverID    string // unique ID of this server
+	serverCount int    // Number of proxy server instances, should be 1 unless it is a HA server.
+
+	// Allows a special debug flag which warns if we write to a full transfer channel
+	warnOnChannelLimit bool
+
+	// agent authentication
+	AgentAuthenticationOptions *AgentTokenAuthenticationOptions
+
+	proxyStrategies []ProxyStrategy
+}
+```
+
+BackendManagers: 不同代理类型的backendmanager,即: proxy server为不同的代理方式提供不同的backend存储和管理方式.
+
+Readiness: 检查proxy server是否就绪,即是否和proxy agent有连接,而不检查连接是否正常(proxy agent会检查),所以proxy server可能就绪但连接不健康.
+
+frontends: 存储着proxy server到真正客户端的连接.通过frontends\[agentID][connID]来唯一确定一个真正客户端到proxy server的连接.connID是proxy agent与真正后端服务建立的tcp连接.
+
+PendingDial: 
+
+AgentAuthenticationOptions: 用来进行身份验证的
+
+proxyStrategies: 存储着该proxy server的代理方式, 不同的存储方式会有不同的BackendManager负责后端连接, 该字段在初始化时候会给出.
+
+通过结构定义可以看到: <font color=red>proxy server同时管理着到后端代理proxy agent的gRPC连接和与真正前面的连接</font>
+
+### 连接管理
+
+#### 后端连接管理
+
+proxy server和proxy agent之间的gRPC连接通过BackendManager管理着,proxy server实现的addBackend、getBackend和removeBackend方法也都是通过遍历这些manager然后调用他们底层的增删改方法实现的.
+
+在proxy agent反向连接proxy server的时候,会在header传入`agentID`和`identifiers`字段,proxy server就是根据这些标识来把gRPC连接存储到对应的BackendManager中.
+
+![image-20211122122134799](https://tva1.sinaimg.cn/large/008i3skNly1gwnt7akzzgj31030q9dkl.jpg)
+
+#### 前端连接管理
+
+通过agentID和connID来唯一确定一个客户端和proxy server之间的连接,即: ProxyClientConneciton, 前端连接都存储在frontedns变量中.
+
+#### 两者关系
+
+我们知道多个客户端可以发送请求到同一个proxy server,所以前端连接和后端gRPC连接是 `1:n` 的关系.
+
+通过ProxyClientConnection的backend字段可以拿到对应的后端连接
+
+也可以给定agentID和backend查找所有对应的前端连接.
+
+![image-20211122140941834](https://tva1.sinaimg.cn/large/008i3skNly1gwnwbrrm1qj30xq0bl3zm.jpg)
+
+
+
+<img src="https://tva1.sinaimg.cn/large/008i3skNgy1gwnwimnup2j30tq0n9gn7.jpg" alt="未命名文件 (2)" style="zoom:67%;" />
+
+
+
+### 服务定义
+
+proxy server一共提供两种gRPC方法: 一个用于proxy agent的Connect方法,一个用于代理客户端的Proxy方法.
+
+#### Connect
 
 
 
@@ -397,7 +553,7 @@ func (cs *ClientSet) Serve() {
 
 所以这个方法的核心功能就是syncOnce()函数的功能.
 
-![image-20211119135425008](https://tva1.sinaimg.cn/large/008i3skNly1gwki0jcvy0j30wp0go404.jpg)
+![image-20211119135425008](https://tva1.sinaimg.cn/large/008i3skNly1gwkmesm15wj30wp0go404.jpg)
 
 一次同步过程所做的工作如下:
 
