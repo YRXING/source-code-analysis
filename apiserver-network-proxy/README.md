@@ -358,7 +358,7 @@ proxy server一共提供两种gRPC方法: 一个用于proxy agent的Connect方�
 
    ![image-20211122144531532](https://tva1.sinaimg.cn/large/008i3skNly1gwnxd2f2l0j312k0ocacf.jpg)
 
-可以看到只要proxy agent与proxy server之间的gRPC连接建立, 它的关闭不由proxy server控制,而是由proxy agent决定,当proxy agent关闭数据流时候, 即`err == io.EOF`,这两个协程才会退出.
+可以看到只要proxy agent与proxy server之间的gRPC连接建立, 它的关闭不由proxy server控制,而是由proxy agent决定,当proxy agent关闭数据流时候, 即`err == io.EOF`,这两个协程才会退出.协程退出后,针对该gRPC流的Connect服务结束,proxy server会从BackendManager中移除该流引用.
 
 下面来看一下proxy server是怎么处理来自proxy agent的数据包的:
 
@@ -633,7 +633,7 @@ client在建立连接的过程中(就是调用远程grpc server的connect方法)
 
 client所有功能的开启是通过Serve()函数,此函数开启了三个协程:probe、proxyToRemote、remoteToproxy.其中probe函数是周期性的检测gRPC连接的状态,如果连接不正常,就回调用ClientSet的RemoveClient函数,该函数就是调用Client的Close函数并把Client从ClientSet中清除掉.
 
-当Serve()函数收到stopCh信号后,也会执行defer退出函数,首先会遍历connManager中的TCP连接,执行cleanup函数把这些连接清除掉,返回给proxy server CloseRespne信息,然后调用ClientSet的RemoveClient函数,将client彻底清除掉.
+当Serve()函数收到stopCh信号后,也会执行defer退出函数,首先会遍历connManager中的TCP连接,执行cleanup函数把这些连接清除掉,返回给proxy server CloseRespne信息,proxy server会清除前端连接,然后调用ClientSet的RemoveClient函数,将client彻底清除掉.
 
 ![image-20211119134247068](https://tva1.sinaimg.cn/large/008i3skNly1gwkeosbcj2j30x2091my2.jpg)
 
