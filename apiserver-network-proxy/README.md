@@ -356,7 +356,7 @@ proxy server一共提供两种gRPC方法: 一个用于proxy agent的Connect方�
 
 4. 此时gRPC连接已经准备就绪,开始异步处理来自proxy agent的数据.一个协程专门用来接受来自proxy agent的数据,一个协程专门来处理数据.<font color=red>因此每一个proxy agent连接到proxy server后,proxy server都会开启两个协程为其服务.</font>
 
-   ![image-20211122144531532](https://tva1.sinaimg.cn/large/008i3skNly1gwnxd2f2l0j312k0ocacf.jpg)
+   ![image-20211122144531532](https://tva1.sinaimg.cn/large/008i3skNly1gwo68wtq1xj312k0ocacf.jpg)
 
 可以看到只要proxy agent与proxy server之间的gRPC连接建立, 它的关闭不由proxy server控制,而是由proxy agent决定,当proxy agent关闭数据流时候, 即`err == io.EOF`,这两个协程才会退出.协程退出后,针对该gRPC流的Connect服务结束,proxy server会从BackendManager中移除该流引用.
 
@@ -638,6 +638,8 @@ client所有功能的开启是通过Serve()函数,此函数开启了三个协程
 ![image-20211119134247068](https://tva1.sinaimg.cn/large/008i3skNly1gwkeosbcj2j30x2091my2.jpg)
 
 所以一旦调用Client的Close()函数,那么所有的gRPC和TCP连接都会清除掉.同时也会在ClientSet中清除掉自己.
+
+而如果Client收到CloseRequst数据包时,只会清除对应的与后端服务的tcp连接,并不会清除gRPC连接.
 
 ### ClientSet
 
